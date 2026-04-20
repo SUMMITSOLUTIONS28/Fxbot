@@ -1,0 +1,482 @@
+name: Build SIMIYUFX - Stable Background Bot
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android licenses
+        run: yes | sdkmanager --licenses
+
+      - name: Install Android SDK components
+        run: |
+          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.0'
+
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/simiyufx
+          mkdir -p app/src/main/assets
+          mkdir -p app/src/main/res/layout
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/main/res/drawable
+
+          # Launcher icon
+          cat > app/src/main/res/drawable/ic_launcher.xml << 'EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="48dp"
+              android:height="48dp"
+              android:viewportWidth="48"
+              android:viewportHeight="48">
+            <path
+                android:fillColor="#FF9800"
+                android:pathData="M24,4 C12,4 4,12 4,24 C4,36 12,44 24,44 C36,44 44,36 44,24 C44,12 36,4 24,4 Z"/>
+          </vector>
+          EOF
+
+          # MainActivity.java - extremely simple, no WebView
+          cat > app/src/main/java/com/simiyufx/MainActivity.java << 'JAVA_EOF'
+          package com.simiyufx;
+
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import androidx.appcompat.app.AppCompatActivity;
+
+          public class MainActivity extends AppCompatActivity {
+              private EditText tokenInput;
+              private Button startBtn, stopBtn;
+              private TextView statusText;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  setContentView(R.layout.activity_main);
+
+                  tokenInput = findViewById(R.id.tokenInput);
+                  startBtn = findViewById(R.id.startBtn);
+                  stopBtn = findViewById(R.id.stopBtn);
+                  statusText = findViewById(R.id.statusText);
+
+                  startBtn.setOnClickListener(v -> {
+                      String token = tokenInput.getText().toString().trim();
+                      if (token.isEmpty()) {
+                          Toast.makeText(this, "Enter API token", Toast.LENGTH_SHORT).show();
+                          return;
+                      }
+                      Intent intent = new Intent(this, TradingService.class);
+                      intent.putExtra("token", token);
+                      startService(intent);
+                      statusText.setText("✅ Bot running in background");
+                      startBtn.setEnabled(false);
+                      stopBtn.setEnabled(true);
+                  });
+
+                  stopBtn.setOnClickListener(v -> {
+                      Intent intent = new Intent(this, TradingService.class);
+                      intent.putExtra("stop", true);
+                      startService(intent);
+                      statusText.setText("⛔ Bot stopped");
+                      startBtn.setEnabled(true);
+                      stopBtn.setEnabled(false);
+                  });
+              }
+          }
+          JAVA_EOF
+
+          # activity_main.xml - simple layout
+          cat > app/src/main/res/layout/activity_main.xml << 'XML_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="20dp"
+              android:gravity="center"
+              android:background="#0f172a">
+              <TextView android:text="🐉 SIMIYUFX PRO BOT" android:textSize="28sp" android:textColor="#38bdf8" android:layout_marginBottom="30dp"/>
+              <EditText android:id="@+id/tokenInput" android:hint="Deriv API Token" android:layout_width="match_parent" android:layout_height="wrap_content" android:inputType="textPassword" android:background="#1e293b" android:textColor="#fff" android:padding="12dp" android:layout_marginBottom="20dp"/>
+              <Button android:id="@+id/startBtn" android:text="Start Background Bot" android:layout_width="match_parent" android:layout_height="wrap_content" android:background="#22c55e" android:textColor="#fff" android:padding="12dp" android:layout_marginBottom="10dp"/>
+              <Button android:id="@+id/stopBtn" android:text="Stop Bot" android:layout_width="match_parent" android:layout_height="wrap_content" android:background="#ef4444" android:textColor="#fff" android:padding="12dp" android:enabled="false"/>
+              <TextView android:id="@+id/statusText" android:text="Bot not running" android:layout_marginTop="20dp" android:textColor="#fff"/>
+          </LinearLayout>
+          XML_EOF
+
+          # TradingService.java - creates WebView on UI thread
+          cat > app/src/main/java/com/simiyufx/TradingService.java << 'SERVICE_EOF'
+          package com.simiyufx;
+
+          import android.app.*;
+          import android.content.*;
+          import android.net.ConnectivityManager;
+          import android.net.Network;
+          import android.os.*;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.webkit.WebChromeClient;
+          import androidx.core.app.NotificationCompat;
+          import java.io.*;
+
+          public class TradingService extends Service {
+              private WebView webView;
+              private String apiToken = "";
+              private Handler mainHandler = new Handler(Looper.getMainLooper());
+
+              @Override
+              public void onCreate() {
+                  super.onCreate();
+                  startForeground(1, createNotification());
+                  // Create WebView on UI thread
+                  mainHandler.post(() -> {
+                      webView = new WebView(this);
+                      webView.getSettings().setJavaScriptEnabled(true);
+                      webView.getSettings().setDomStorageEnabled(true);
+                      webView.getSettings().setAllowFileAccess(true);
+                      webView.setWebViewClient(new WebViewClient());
+                      webView.setWebChromeClient(new WebChromeClient());
+                      webView.loadUrl("file:///android_asset/dashboard.html");
+                  });
+                  monitorConnectivity();
+              }
+
+              private void monitorConnectivity() {
+                  ConnectivityManager cm = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+                  ConnectivityManager.NetworkCallback networkCallback = new ConnectivityManager.NetworkCallback() {
+                      @Override
+                      public void onAvailable(Network network) {
+                          mainHandler.post(() -> {
+                              if (webView != null) {
+                                  webView.evaluateJavascript("if(typeof autoConnect === 'function') autoConnect();", null);
+                              }
+                          });
+                      }
+                  };
+                  cm.registerDefaultNetworkCallback(networkCallback);
+              }
+
+              private Notification createNotification() {
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      NotificationChannel ch = new NotificationChannel("simiyufx_bg", "SIMIYUFX Bot", NotificationManager.IMPORTANCE_LOW);
+                      getSystemService(NotificationManager.class).createNotificationChannel(ch);
+                  }
+                  return new NotificationCompat.Builder(this, "simiyufx_bg")
+                          .setContentTitle("SIMIYUFX Bot")
+                          .setContentText("Trading in background")
+                          .setSmallIcon(android.R.drawable.ic_menu_upload)
+                          .build();
+              }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  if (intent != null) {
+                      if (intent.hasExtra("token")) {
+                          apiToken = intent.getStringExtra("token");
+                          mainHandler.post(() -> {
+                              if (webView != null) {
+                                  webView.evaluateJavascript(
+                                      "localStorage.setItem('apiToken', '" + apiToken + "');" +
+                                      "if(typeof autoConnect === 'function') autoConnect();",
+                                      null
+                                  );
+                              }
+                          });
+                      } else if (intent.hasExtra("stop")) {
+                          mainHandler.post(() -> {
+                              if (webView != null) {
+                                  webView.evaluateJavascript("if(typeof disconnect === 'function') disconnect();", null);
+                              }
+                          });
+                          stopSelf();
+                      }
+                  }
+                  return START_STICKY;
+              }
+
+              @Override
+              public void onDestroy() {
+                  mainHandler.post(() -> {
+                      if (webView != null) {
+                          webView.destroy();
+                          webView = null;
+                      }
+                  });
+                  super.onDestroy();
+              }
+
+              @Override
+              public IBinder onBind(Intent intent) { return null; }
+          }
+          SERVICE_EOF
+
+          # dashboard.html (your original trading dashboard)
+          cat > app/src/main/assets/dashboard.html << 'HTML_EOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          <title>SIMIYUFX PRO TRADING BOT</title>
+          <style>
+          *{margin:0;padding:0;box-sizing:border-box;font-family:Segoe UI,sans-serif}
+          body{background:linear-gradient(135deg,#0f172a,#1e293b);color:#fff;min-height:100vh}
+          .container{max-width:1400px;margin:auto;padding:12px}
+          .header{display:flex;justify-content:space-between;align-items:center;background:#111827;padding:12px;border-radius:12px}
+          .logo{font-size:18px;font-weight:700;color:#38bdf8}
+          .controls{display:flex;gap:8px}
+          input{padding:8px;border-radius:8px;border:1px solid #334155;background:#0f172a;color:#fff;width:200px}
+          button{padding:8px 12px;border-radius:8px;border:none;cursor:pointer;font-weight:600}
+          .connect{background:#22c55e;color:#fff}
+          .disconnect{background:#ef4444;color:#fff}
+          .statusBar{display:flex;justify-content:space-between;margin-top:10px;padding:10px;background:#111827;border-radius:10px}
+          .badge{padding:4px 10px;border-radius:20px;font-size:12px}
+          .live{background:#22c55e}
+          .stop{background:#ef4444}
+          .connecting{background:#f59e0b}
+          .account{margin-top:10px;display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+          .box{background:#111827;padding:10px;border-radius:10px;text-align:center}
+          .box h4{font-size:11px;color:#94a3b8}
+          .box span{font-size:16px;font-weight:700;color:#38bdf8}
+          .grid{margin-top:10px;display:grid;grid-template-columns:repeat(5,1fr);gap:10px}
+          .card{background:#111827;padding:10px;border-radius:10px;text-align:center}
+          .card span{font-size:18px;font-weight:bold;color:#22c55e}
+          .row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px}
+          .panel{background:#111827;padding:10px;border-radius:10px;height:260px;overflow:hidden}
+          table{width:100%;font-size:11px}
+          th,td{padding:5px;border-bottom:1px solid #1f2937}
+          .profit{color:#22c55e}
+          .loss{color:#ef4444}
+          .log{margin-top:10px;background:#000;color:#00ff88;padding:10px;border-radius:10px;height:140px;overflow:auto;font-size:11px}
+          .botStatus{font-size:12px;color:#38bdf8}
+          </style>
+          </head>
+          <body>
+          <div class="container">
+          <div class="header"><div class="logo">🐉 SIMIYUFX PRO BOT</div><div class="controls"><input id="token" placeholder="Deriv API Token"><button class="connect" id="connectBtn">Connect</button><button class="disconnect" id="disconnectBtn" style="display:none">Disconnect</button></div></div>
+          <div class="statusBar"><div>Status: <span id="status" class="badge stop">STOPPED</span> <span class="botStatus" id="botState">BOT OFFLINE</span></div><div id="signal">Waiting...</div></div>
+          <div class="account"><div class="box"><h4>LOGIN ID</h4><span id="login">---</span></div><div class="box"><h4>ACCOUNT TYPE</h4><span id="accType">---</span></div><div class="box"><h4>BALANCE</h4><span id="balance">0</span></div><div class="box"><h4>CURRENCY</h4><span id="currency">---</span></div></div>
+          <div class="grid"><div class="card">Equity<br><span id="equity">0</span></div><div class="card">P/L<br><span id="pnl">0</span></div><div class="card">Open Trades<br><span id="open">0</span></div><div class="card">Loss Streak<br><span id="loss">0</span></div><div class="card">Active Bots<br><span>1</span></div></div>
+          <div class="row"><div class="panel"><h4>LIVE TRADES</h4><table><thead><tr><th>Pair</th><th>Position</th><th>P/L</th></tr></thead><tbody id="live"></tbody></table></div><div class="panel"><h4>TRADE HISTORY</h4><table><thead><tr><th>Time</th><th>Pair</th><th>P/L</th></tr></thead><tbody id="history"></tbody></table></div></div>
+          <div class="log" id="log"></div>
+          </div>
+          <script>
+          const WS="wss://ws.derivws.com/websockets/v3?app_id=1089";
+          const PAIRS=["frxEURUSD","frxUSDJPY","frxGBPUSD","frxUSDCHF","frxUSDCAD","frxAUDUSD","frxNZDUSD","frxEURGBP","frxEURJPY","frxEURCHF","frxEURAUD","frxEURCAD","frxEURNZD","frxGBPJPY","frxGBPCHF","frxGBPAUD","frxGBPCAD","frxAUDJPY","frxAUDCAD","frxNZDJPY","frxCADJPY"];
+          const TF={1:60,2:120,5:300,15:900,30:1800,45:2700};
+          const LOT_SIZE=0.01;
+          let ws,token="",balance=0,equity=0,candles=new Map,sweeps=new Map,trades=new Map,history=[],loss=0,activeTrades=0,lastPing=Date.now(),lastSymbol=null,lastDirection=null,prices=new Map;
+          const $=id=>document.getElementById(id);
+          function log(t){$("log").innerHTML+=t+"<br>";$("log").scrollTop=$("log").scrollHeight;}
+          function setStatus(t,c){$("status").innerText=t;$("status").className="badge "+c;}
+          function setBotState(t){$("botState").innerText=t;}
+          function send(d){if(ws&&ws.readyState===1)ws.send(JSON.stringify(d));}
+          function connect(t){
+            token=t;ws=new WebSocket(WS);setStatus("CONNECTING","connecting");setBotState("CONNECTING...");
+            ws.onopen=()=>send({authorize:token});
+            ws.onmessage=e=>{
+              lastPing=Date.now();const d=JSON.parse(e.data);
+              if(d.msg_type==="error"){log("ERROR: "+JSON.stringify(d.error));return;}
+              if(d.msg_type==="authorize"){
+                setStatus("CONNECTED","live");setBotState("CONNECTED");
+                $("login").innerText=d.authorize.loginid||"---";
+                $("currency").innerText=d.authorize.currency||"---";
+                $("accType").innerText=d.authorize.is_virtual?"DEMO":"REAL";
+                $("connectBtn").style.display="none";$("disconnectBtn").style.display="inline-block";
+                send({balance:1,subscribe:1});
+                PAIRS.forEach(s=>Object.values(TF).forEach(g=>send({ticks_history:s,style:"candles",granularity:g,count:50,end:"latest",subscribe:1})));
+                return;
+              }
+              if(d.msg_type==="balance"){balance=equity=d.balance.balance;render();}
+              if(d.msg_type==="buy"){
+                const id=d.buy.contract_id;
+                let trade={id,symbol:lastSymbol,entry:prices.get(lastSymbol)||0,pnl:0,sl:0,tp:0,direction:lastDirection,position:"OPEN"};
+                const dist=0.0005;
+                if(lastDirection==="CALL"){trade.sl=trade.entry-dist;trade.tp=trade.entry+dist*3;}
+                else{trade.sl=trade.entry+dist;trade.tp=trade.entry-dist*3;}
+                trades.set(id,trade);activeTrades++;render();
+              }
+              if(d.msg_type==="proposal_open_contract"){
+                const oc=d.proposal_open_contract;if(!oc)return;
+                const t=trades.get(oc.contract_id);if(!t)return;
+                t.pnl=oc.profit;
+                if(oc.is_sold){
+                  activeTrades--;
+                  history.push({time:Date.now(),symbol:t.symbol,pnl:oc.profit});
+                  if(oc.profit<0)loss++;else loss=0;
+                  trades.delete(oc.contract_id);render();
+                }
+              }
+              if(d.msg_type==="candles"){
+                const c=d.candles?.[0];if(!c)return;
+                const symbol=d.echo_req.symbol,g=d.echo_req.granularity;
+                prices.set(symbol,c.close);
+                const tf=Object.keys(TF).find(k=>TF[k]==g);if(!tf)return;
+                lastSymbol=symbol;
+                if(!candles.has(symbol))candles.set(symbol,{});
+                const m=candles.get(symbol);
+                if(!m[tf])m[tf]=[];
+                m[tf].push(c);
+                if(m[tf].length<3)return;
+                const prev=m[tf][m[tf].length-2],last=m[tf][m[tf].length-1];
+                if([45,30,15,5].includes(+tf)){
+                  if(last.high>prev.high&&last.close<prev.high){sweeps.set(symbol,{type:"bearish"});log("Bearish sweep "+symbol);}
+                  if(last.low<prev.low&&last.close>prev.low){sweeps.set(symbol,{type:"bullish"});log("Bullish sweep "+symbol);}
+                }
+                if([1,2].includes(+tf)){
+                  const sw=sweeps.get(symbol);
+                  if(!sw||activeTrades>=3||loss>=3)return;
+                  let dir=null;
+                  if(sw.type==="bearish"&&last.close>prev.high)dir="CALL";
+                  if(sw.type==="bullish"&&last.close<prev.low)dir="PUT";
+                  if(dir){
+                    lastDirection=dir;
+                    send({proposal:1,amount:LOT_SIZE,basis:"stake",contract_type:dir,currency:"USD",duration:1,duration_unit:"m",symbol});
+                    sweeps.delete(symbol);
+                  }
+                }
+              }
+            };
+            ws.onclose=()=>{
+              setStatus("DISCONNECTED","stop");setBotState("DISCONNECTED");
+              $("connectBtn").style.display="inline-block";$("disconnectBtn").style.display="none";
+              setTimeout(()=>connect(token),2000);
+            };
+          }
+          function disconnect(){if(ws)ws.close();}
+          function autoConnect(){
+            const savedToken=localStorage.getItem("apiToken");
+            if(savedToken&&savedToken!=="")connect(savedToken);
+          }
+          setInterval(()=>{if(!ws){setBotState("OFFLINE");return;}if(ws.readyState===1&&Date.now()-lastPing<5000){setBotState("CONNECTED");}else{setBotState("RECONNECTING...");}},2000);
+          setInterval(()=>{trades.forEach((t,id)=>{const price=prices.get(t.symbol);if(!price)return;if((t.direction==="CALL"&&(price>=t.tp||price<=t.sl))||(t.direction==="PUT"&&(price<=t.tp||price>=t.sl))){t.position="CLOSED";activeTrades--;history.push({time:Date.now(),symbol:t.symbol,pnl:t.pnl||0});if((t.pnl||0)<0)loss++;else loss=0;trades.delete(id);render();}});},500);
+          function render(){
+            $("balance").innerText=balance.toFixed(2);$("equity").innerText=equity.toFixed(2);$("open").innerText=activeTrades;$("loss").innerText=loss;
+            let pnl=0;trades.forEach(t=>pnl+=t.pnl||0);$("pnl").innerText=pnl.toFixed(2);
+            let lb=$("live");lb.innerHTML="";trades.forEach(t=>{let r=lb.insertRow();r.innerHTML=`<td>${t.symbol}</td><td>${t.position}</td><td class="${t.pnl>=0?'profit':'loss'}">${(t.pnl||0).toFixed(2)}</td>`;});
+            let hb=$("history");hb.innerHTML="";history.slice(-10).reverse().forEach(h=>{let r=hb.insertRow();r.innerHTML=`<td>${new Date(h.time).toLocaleTimeString()}</td><td>${h.symbol}</td><td>${(h.pnl||0).toFixed(2)}</td>`;});
+          }
+          $("connectBtn").onclick=()=>{const t=$("token").value.trim();if(!t)return alert("Invalid token");connect(t);};
+          $("disconnectBtn").onclick=()=>{disconnect();};
+          if(localStorage.getItem("apiToken"))autoConnect();
+          </script>
+          </body>
+          </html>
+          HTML_EOF
+
+          # AndroidManifest.xml
+          cat > app/src/main/AndroidManifest.xml << 'MANIFEST_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <application android:allowBackup="true" android:icon="@drawable/ic_launcher" android:label="SIMIYUFX" android:usesCleartextTraffic="true" android:theme="@style/Theme.AppCompat.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".TradingService" android:exported="false" />
+              </application>
+          </manifest>
+          MANIFEST_EOF
+
+          # styles.xml
+          cat > app/src/main/res/values/styles.xml << 'STYLES_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.AppCompat.NoActionBar" parent="Theme.AppCompat.Light.NoActionBar" />
+          </resources>
+          STYLES_EOF
+
+          # build.gradle (root)
+          cat > build.gradle << 'GRADLE_EOF'
+          buildscript {
+              repositories { google(); mavenCentral() }
+              dependencies { classpath 'com.android.tools.build:gradle:8.1.0' }
+          }
+          GRADLE_EOF
+
+          # settings.gradle
+          cat > settings.gradle << 'SETTINGS_EOF'
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "SIMIYUFX"
+          include ':app'
+          SETTINGS_EOF
+
+          # app/build.gradle
+          cat > app/build.gradle << 'APP_GRADLE_EOF'
+          plugins { id 'com.android.application' }
+          android {
+              namespace 'com.simiyufx'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.simiyufx"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          dependencies {
+              implementation 'androidx.appcompat:appcompat:1.6.1'
+              implementation 'androidx.core:core:1.12.0'
+          }
+          configurations.all {
+              resolutionStrategy { force 'org.jetbrains.kotlin:kotlin-stdlib:1.9.0' }
+              exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk7'
+              exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk8'
+          }
+          APP_GRADLE_EOF
+
+          # gradle.properties
+          cat > gradle.properties << 'PROPERTIES_EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          android.suppressUnsupportedCompileSdk=34
+          PROPERTIES_EOF
+
+      - name: Generate Gradle Wrapper
+        run: |
+          gradle wrapper --gradle-version 8.0 --distribution-type all
+          chmod +x gradlew
+
+      - name: Build APK
+        run: ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SIMIYUFX-Stable-Background
+          path: app/build/outputs/apk/debug/*.apk
